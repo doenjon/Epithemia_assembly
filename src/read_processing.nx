@@ -1,0 +1,356 @@
+
+nextflow.enable.dsl=2
+
+include { diamond } from "./assembly_analysis.nx"
+
+////////////////////////////////////////////////////////////////////////
+/////////////////////////// Work flows /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+
+workflow preprocess_nanopore {
+
+  take:
+    fast5_dir
+    ont_reads 
+    phred_cutoff 
+    name
+
+  main:
+
+    pubDir = "reads/nanopore/${name}/phred${phred_cutoff}/"
+
+    // Handle nanopore
+    if (fast5_dir) {
+      guppy(Channel.fromList(fast5_dir), pubDir)
+      combined_reads = guppy_collect(guppy.out.reads.toList(), name, pubDir + "/guppy").reads
+    } else {
+      combined_reads = guppy_collect(Channel.fromList(ont_reads).toList(), name, pubDir).reads
+    }
+
+    // Prefiltered read analysis
+    nanoplot(combined_reads, pubDir)
+    
+    // Filter reads
+    ont_reads = nanofilt(combined_reads, phred_cutoff, pubDir).fastq_filt
+
+    // Postfilter read analysis
+    fastqc(ont_reads, pubDir)  //<- sometimes broken, JVM suck, not enough memory allocated for long reads. If dies on memory, github says to give more threads
+	
+    // Do phylogenetic analysis on a subsample of reads
+    num_reads = 1000
+    seed = 0
+    diamond(ont_reads.splitFastq(by:num_reads, file:true).first(), pubDir)
+
+  emit: 
+    ont_reads
+}
+
+workflow preprocess_illumina {
+
+  main:
+
+    pubDir = "reads/illumina"
+
+    // Handle illumina reads
+    if(params.illumina) {
+      
+      illumina_reads = fastp(Channel.fromList(params.illumina), pubDir).reads
+      fastqc(illumina_reads, pubDir)
+
+    } else {
+      // In case you have no illumina reads
+      illumina_reads = Channel.empty()
+    }
+
+  emit: 
+    illumina_reads = illumina_reads
+}
+
+workflow preprocess_rna_seq {
+
+	main:
+
+		pubDir = "reads/rna_seq"
+
+		if(params.rna_seq) {
+
+      println 'Processing RNA seq Reads'
+			rna_seq = fastp(Channel.fromList(params.rna_seq), pubDir).reads
+
+	    rna_seq.multiMap { it ->
+	            forward: it[0]
+	            reverse: it[1]
+	            }
+	        .set { rna_seq_split }
+
+	    rna_seq = collect_illseq(rna_seq_split.forward.toList(), rna_seq_split.reverse.toList(), pubDir + "/rna_seq_reads_/").reads
+	  } else {
+      println 'Not processing RNA seq Reads'
+
+	  	rna_seq = Channel.empty()
+
+	  }
+
+    emit: 
+      rna_seq_reads = rna_seq
+}
+
+
+////////////////////////////////////////////////////////////////////////
+//////////////////////////// Processes /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+process combine_ont {
+  publishDir { params.results + pubDir + "/" + "combined_axenic_diatomxenic" } , mode: "copy"
+
+  label "slurm_short"
+
+  input:
+    path(fastq)
+    path(fastq2)
+
+  output:
+    path(all_reads), emit: reads
+
+  script:
+    all_reads = params.prefix + "_combined_reads.fastq"
+    """
+    if [[ ${fastq} == *.gz ]]; 
+    then
+      gunzip -c ${fastq} > fastq_1.fastq
+    else 
+      cp ${fastq} fastq_1.fastq
+    fi
+
+    if [[ ${fastq2} == *.gz ]]; 
+    then
+      gunzip -c ${fastq2} > fastq_2.fastq
+    else 
+      cp ${fastq2} fastq_2.fastq
+    fi
+
+    cat fastq_1.fastq fastq_2.fastq > $all_reads
+    """
+}
+
+process guppy {
+  publishDir { params.results + pubDir + "/" + "guppy" } , mode: "copy"
+  cache "lenient"
+  label "slurm_guppy"
+  
+  
+  input:
+    path(fast5_dir) 
+    val(pubDir)
+
+  output:
+    path("${append}_combined.fastq.gz"), emit: reads
+
+  script:
+    append = fast5_dir.SimpleName
+    """
+    IFS=', ' read -r -a array <<< \$CUDA_VISIBLE_DEVICES
+    cuda_var=""
+    for element in "\${array[@]}" 
+      do 
+      cuda_var="\${cuda_var} cuda:\${element}"
+      done
+    echo \$cuda_var
+
+    /home/groups/ellenyeh/jdoenier/bin/ont-guppy/bin/guppy_basecaller --min_qscore 10 --recursive -c ${params.guppy_config} --compress_fastq --trim_barcodes -i ./${fast5_dir} -s ./ --device "\$cuda_var"
+    cat pass/*.fastq.gz >> ${append}_combined.fastq.gz
+    
+    """
+} 
+
+process guppy_collect {
+  publishDir { params.results + pubDir } , mode: "copy"
+  label "slurm_short"
+  
+
+  input:
+    path(fastq)
+    val(name)
+    val(pubDir)
+
+  output:
+    path(all_reads), emit: reads
+
+  script:
+    all_reads = params.prefix + name + "_combined_reads.fastq.gz"
+    """
+    cat $fastq >> $all_reads
+    """
+}
+
+process nanofilt {
+  label "slurm_nanofilt"
+  publishDir { params.results + pubDir + "/" + "nanofilt" } , mode: "copy"
+  
+
+  input:
+    path(fastq)
+    val(base_quality)
+    val(pubDir)
+
+  output:
+    path(output_fastq), emit: fastq_filt
+
+  script:
+    output_fastq = fastq.SimpleName + "_filtered.fastq.gz"
+    """
+    if [[ $fastq == *.gz ]]; 
+    then
+      gunzip -c ${fastq} | NanoFilt --quality ${base_quality} --length ${params.min_read_length} | gzip > ${output_fastq}
+    else 
+      cat ${fastq} | NanoFilt --quality ${base_quality} --length ${params.min_read_length} | gzip > ${output_fastq}
+    fi
+    """
+}
+
+process fastqc {
+
+  publishDir { params.results + pubDir + "/" + "fastqc" } , mode: "copy"
+  errorStrategy = "ignore"
+  label "slurm_short"
+  module "biology"
+  module "fastqc/0.11.8"
+  
+
+  input:
+    path(reads)
+    val(pubDir)
+
+  output:
+    path("*")
+
+  script:
+    threads = 48
+    """
+    fastqc -t ${threads} -o ./ $reads
+    """
+}
+
+process fastp {
+
+  publishDir { params.results + pubDir + "/" + "fastp" } , mode: "copy"
+  label "slurm_fastp"
+  
+
+  input:
+    tuple path(sr_R1), path(sr_R2)
+    val(pubDir)
+
+  output:
+    tuple path(sr_tR1), path(sr_tR2), emit: reads
+    // tuple path(sr_tR1), path(sr_tR2), path(sr_tRu), emit: reads
+    path("*")
+
+  script:
+    sr_tR1 = sr_R1.SimpleName + "_trimmed.fastq"
+    sr_tR2 = sr_R2.SimpleName + "_trimmed.fastq"
+    sr_tRu1 = sr_R1.SimpleName + "_trimmed_unpaired.fastq"
+    sr_tRu2 = sr_R2.SimpleName + "_trimmed_unpaired.fastq"
+    sr_tRu = sr_R1.SimpleName + "R1R2_trimmed_unpaired.fastq"
+
+    """
+    fastp --dedup --thread ${task.cpus} --length_required 80 --low_complexity_filter --qualified_quality_phred 20 --unqualified_percent_limit 20 --in1 ${sr_R1} --in2 ${sr_R2} --out1 ${sr_tR1} --out2 ${sr_tR2} --unpaired1 ${sr_tRu1} --unpaired2 ${sr_tRu2}
+    cat ${sr_tRu1} > ${sr_tRu}
+    cat ${sr_tRu2} >> ${sr_tRu}
+    """
+}
+
+process collect_illseq {
+  publishDir { params.results + pubDir + "/" + "collect" } , mode: "copy"
+  label "slurm_short"
+
+  input:
+    path(r1)
+    path(r2)
+    val(pubDir)
+
+  output:
+    tuple path(all_reads_r1), path(all_reads_r2), emit: reads
+
+  script:
+
+    all_reads_r1 = params.prefix + "_combined_reads_r1.fastq"
+    all_reads_r2 = params.prefix + "_combined_reads_r2.fastq"
+
+    """
+    cat $r1 >> ${all_reads_r1} & 
+    cat $r2 >> ${all_reads_r2}
+    """
+}
+
+
+process nanoplot {
+	label "slurm_nanofilt"
+  	publishDir { params.results + pubDir + "/" + "nanoplot" } , mode: "copy"
+  
+
+  input:
+    path(fastq)
+    val(pubDir)
+
+  output:
+    path("*")
+
+  script:
+    """
+    NanoPlot --threads ${task.cpus} --raw --verbose --fastq ${fastq} -o ./
+    """
+}
+
+
+process remove_organelle_reads {
+  publishDir { params.results + pubDir + "/" + "remove_organelle_reads" } , mode: "copy"
+  label "slurm_mapping"
+
+  input:
+    path(ont_reads)
+    path(spheroid_body)
+    path(chloroplast)
+    path(mitochondria)
+    val(pubDir)
+
+  output:
+    path("non_org.sorted.fastq"), emit: reads
+    path("*")
+
+  script:
+
+    """
+    cat ${spheroid_body} ${chloroplast} ${mitochondria} > orgo.fasta
+
+    minimap2 -ax map-ont orgo.fasta ${ont_reads} | samtools view -b > orgo.bam
+    samtools view -f 4 orgo.bam > non_org.bam
+    samtools sort -@ ${task.cpus} -m 4G non_org.bam > non_org.sorted.bam
+    samtools fastq non_org.sorted.bam > non_org.sorted.fastq
+    """
+}
+
+process get_diatom_reads {
+  publishDir { params.results + pubDir + "/" + "xenic_diatom_reads" } , mode: "copy"
+  label "slurm_mapping"
+
+  input:
+    path(reads)
+    path(asm)
+    val(pubDir)
+
+  output:
+    path("*")
+    path("diatom_reads.fastq"), emit: diatom_reads
+
+  script:
+    """
+    minimap2 -ax map-ont -t ${task.cpus} ${asm} ${reads} | samtools view -b > aln.bam
+    samtools sort -m 4G -@ ${task.cpus} aln.bam > aln.sorted.bam
+    samtools index aln.sorted.bam
+    samtools view -b -F 4 -@ ${task.cpus} -o diatom_reads.bam aln.sorted.bam 
+    samtools fastq diatom_reads.bam > diatom_reads.fastq
+    """
+}
+

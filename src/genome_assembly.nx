@@ -1,0 +1,648 @@
+
+nextflow.enable.dsl=2
+
+include { assembly_analysis; contamination_analysis; quast; merqury_comp; kat_comp; kat_comp as kat_comp2} from "./assembly_analysis.nx"
+include { get_diatom_reads; combine_ont } from "./read_processing.nx"
+////////////////////////////////////////////////////////////////////////
+/////////////////////////// Work flows /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+
+workflow shasta_assembly {
+  take: 
+    ont_reads_axenic
+    ont_reads_xenic
+    illumina_reads
+
+  main:
+    pubDir = "shasta"
+    
+    //Axenic Assembly
+    axenic_asm = shasta(ont_reads_axenic, pubDir).asm
+
+    //Collect diatom read from xenic assembly
+    xenic_diatom_reads = get_diatom_reads(ont_reads_xenic, axenic_asm, pubDir).diatom_reads
+    combined_reads = combine_ont(ont_reads_axenic, xenic_diatom_reads).reads
+
+    // Perform combined assembly
+    asm = shasta_xenic(combined_reads, pubDir).asm
+
+    // Check assembly for potential contamination
+    asm = decontaminate(asm, illumina_reads, pubDir).asm
+
+    // Remove organelles
+    asm = fix_organelles(asm, params.spheroid_body, params.chloroplast, params.mitochondria, pubDir).asm
+
+    // Polish assembly
+    asm = polish_assembly(combined_reads, illumina_reads, asm, pubDir).asm
+
+    // Remove haplotigs
+    asm = purge_haplotigs(asm, combined_reads, 30, 75, pubDir).asm
+
+    // Perform preliminary analysis
+    assembly_analysis(combined_reads, illumina_reads, asm, pubDir)    
+    contamination_analysis(combined_reads, asm, pubDir)
+
+  emit:
+    asm = asm
+}
+
+workflow nextdenovo_assembly {
+  take: 
+    ont_reads_axenic
+    ont_reads_xenic
+    illumina_reads
+
+  main:
+    pubDir = "nextdenovo"
+   
+    //Axenic Assembly
+    axenic_asm = nextdenovo(ont_reads_axenic, pubDir).asm
+
+    //Collect diatom read from xenic assembly
+    xenic_diatom_reads = get_diatom_reads(ont_reads_xenic, axenic_asm, pubDir).diatom_reads
+    combined_reads = combine_ont(ont_reads_axenic, xenic_diatom_reads).reads
+
+    // Perform combined assembly
+    asm = nextdenovo_xenic(combined_reads, pubDir).asm
+
+    // Check assembly for potential contamination
+    asm = decontaminate(asm, illumina_reads, pubDir).asm
+
+    asm = fix_organelles(asm, params.spheroid_body, params.chloroplast, params.mitochondria, pubDir).asm
+
+    // Polish assembly
+    racon_nano(asm, combined_reads, pubDir)
+    asm = polca(racon_nano.out.asm, illumina_reads, pubDir).asm
+
+    asm = purge_haplotigs(asm, combined_reads, 30, 75, pubDir).asm
+
+    // Purge haplotigs
+    asm = purge_haplotigs(asm, combined_reads, 30, 75, pubDir).asm
+
+    // Perform preliminary analysis
+    assembly_analysis(combined_reads, illumina_reads, asm, pubDir)    
+    contamination_analysis(combined_reads, asm, pubDir)
+
+  emit:
+    asm = asm
+}
+
+workflow smartdenovo_assembly {
+  take: 
+    ont_reads_axenic
+    ont_reads_xenic
+    illumina_reads
+
+  main:
+    pubDir = "smartdenovo"
+    
+    //Axenic Assembly
+    axenic_asm = smartdenovo(ont_reads_axenic, pubDir).asm
+
+    //Collect diatom read from xenic assembly
+    xenic_diatom_reads = get_diatom_reads(ont_reads_xenic, axenic_asm, pubDir).diatom_reads
+    combined_reads = combine_ont(ont_reads_axenic, xenic_diatom_reads).reads
+
+    // Perform combined assembly
+    asm = smartdenovo_xenic(combined_reads, pubDir).asm
+
+    // Check assembly for potential contamination
+    asm = decontaminate(asm, illumina_reads, pubDir).asm
+    asm = fix_organelles(asm, params.spheroid_body, params.chloroplast, params.mitochondria, pubDir).asm
+
+    // Polish assembly
+    asm = polish_assembly(combined_reads, illumina_reads, asm, pubDir).asm
+
+    // Purge haplotigs
+    asm = purge_haplotigs(asm, combined_reads, 30, 85, pubDir).asm
+
+    // Perform preliminary analysis
+    assembly_analysis(combined_reads, illumina_reads, asm, pubDir)    
+    contamination_analysis(combined_reads, asm, pubDir)
+}
+
+
+workflow polish_assembly {
+  /* 
+  A workflow to polish ont based assemblies
+  */ 
+  take:
+    ont_reads
+    illumina_reads
+    assembly
+    pubDir
+
+  main:
+
+    pubDir = pubDir + "/polishing"
+
+    nextPolish_extra(assembly, illumina_reads, ont_reads, pubDir)
+
+    polca(nextPolish_extra.out.asm, illumina_reads, pubDir)
+
+  emit: 
+    asm = polca.out.asm
+}
+
+////////////////////////////////////////////////////////////////////////
+//////////////////////////// Processes /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+
+process shasta {
+  /* 
+  A process to perform genome assembly using shasta
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "shasta" } , mode: "copy"
+  label "slurm_shasta"
+  
+  input:
+    path(reads)
+    val(pubDir)
+
+  output:
+    path("asm/Assembly.fasta"), emit: asm
+    path("asm/*")
+
+  script:
+    """    
+    if [[ ${reads} == *.gz ]]; 
+    then
+      gunzip -c ${reads} > input_reads.fastq
+    else 
+      cp ${reads} input_reads.fastq
+    fi
+
+    shasta --input input_reads.fastq --assemblyDirectory "./asm" --command assemble --threads ${task.cpus} --config Nanopore-May2022 --Reads.minReadLength 9000 --MinHash.minHashIterationCount 30 --MinHash.maxBucketSize 22 --ReadGraph.creationMethod 0 --ReadGraph.maxAlignmentCount 12 --MarkerGraph.edgeMarkerSkipThreshold 20 --MarkerGraph.pruneIterationCount 4 --Assembly.pruneLength 2 --Assembly.detangleMethod 1 --MarkerGraph.simplifyMaxLength 10,100,1000,10000,100000 
+    """
+}
+
+
+process shasta_xenic {
+  /* 
+  A process to perform genome assembly using shasta
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "shasta_xenic" } , mode: "copy"
+  label "slurm_shasta"
+  
+  input:
+    path(reads)
+    val(pubDir)
+
+  output:
+    path("asm/Assembly.fasta"), emit: asm
+    path("asm/*")
+
+  script:
+    """    
+    if [[ ${reads} == *.gz ]]; 
+    then
+      gunzip -c ${reads} > input_reads.fastq
+    else 
+      cp ${reads} input_reads.fastq
+    fi
+       
+    shasta --input input_reads.fastq --assemblyDirectory ./asm --command assemble --threads ${task.cpus}  --config Nanopore-May2022 --Reads.minReadLength 15000 --MinHash.minHashIterationCount 30 --MinHash.m 3 --MinHash.minFrequency 4 --MinHash.minBucketSize 7 --MinHash.maxBucketSize 20 --Align.maxMarkerFrequency 16 --Align.minAlignedMarkerCount 140 --Align.maxSkip 170 --Align.maxDrift 130 --Align.maxTrim 40 --Align.minAlignedFraction 0.4 --Align.downsamplingFactor 0.09 --Align.bandExtend 5 --ReadGraph.creationMethod 0 --ReadGraph.maxAlignmentCount 18 --ReadGraph.strandSeparationMethod 1 --MarkerGraph.maxDistance 25 --MarkerGraph.edgeMarkerSkipThreshold 20 --MarkerGraph.simplifyMaxLength 10,100,1000,10000,100000,1000000 --Assembly.pruneLength 4 --Assembly.detangleMethod 2 
+
+    """
+}
+
+
+process nextdenovo {
+
+  publishDir { params.results + pubDir + "/" + "nextdenovo" } , mode: "copy"
+  label "slurm_nextdenovo"
+  
+  input:
+    path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("work/03.ctg_graph/*.asm.fasta"), emit: asm
+    path("*")
+
+  script:
+    """
+
+    cat > run.cfg <<- EOM
+    [General]
+    job_type = slurm
+    job_prefix = nextDenovo
+    task = all
+    rewrite = yes
+    deltmp = yes
+    parallel_jobs = 300
+    input_type = raw
+    read_type = ont # clr, ont, hifi
+    input_fofn = input.fofn
+    workdir = work
+
+    [correct_option]
+    read_cutoff = 5k
+    genome_size = ${params.genome_size} # estimated genome size
+    sort_options = -m 224g -t 24
+    minimap2_options_raw = -t 16
+    pa_correction = 24
+    correction_options = -p 30
+
+    [assemble_option]
+    minimap2_options_cns = -t 16
+    nextgraph_options = -a 1
+    EOM
+    
+    ls ${ont_reads} > input.fofn
+
+    /home/groups/ellenyeh/jdoenier/bin/NextDenovo/nextDenovo run.cfg
+    """
+}
+
+
+process nextdenovo_xenic {
+
+  publishDir { params.results + pubDir + "/" + "nextdenovo_xenic" } , mode: "copy"
+  label "slurm_nextdenovo"
+  
+  input:
+    path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("work/03.ctg_graph/*.asm.fasta"), emit: asm
+    path("*")
+
+  script:
+    """
+
+    cat > run.cfg <<- EOM
+    [General]
+    job_type = slurm
+    job_prefix = nextDenovo
+    task = all
+    rewrite = yes
+    deltmp = yes
+    parallel_jobs = 300
+    input_type = raw
+    read_type = ont # clr, ont, hifi
+    input_fofn = input.fofn
+    workdir = work
+
+    [correct_option]
+    read_cutoff = 5k
+    genome_size = ${params.genome_size} # estimated genome size
+    sort_options = -m 224g -t 24
+    minimap2_options_raw = -t 16
+    pa_correction = 24
+    correction_options = -p 30
+
+    [assemble_option]
+    minimap2_options_cns = -t 16
+    nextgraph_options = -a 1
+    EOM
+    
+    ls ${ont_reads} > input.fofn
+
+    /home/groups/ellenyeh/jdoenier/bin/NextDenovo/nextDenovo run.cfg
+    """
+}
+
+
+process smartdenovo {
+
+  publishDir { params.results + pubDir + "/" + "smartdenovo" } , mode: "copy"
+  label "slurm_smartdenovo"
+  
+  input:
+    path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("*.utg"), emit: asm
+    path("*")
+
+  script:
+    """
+    # /home/groups/ellenyeh/jdoenier/bin/smartdenovo/smartdenovo.pl -p ${params.prefix} -c 1 ${ont_reads} -t ${task.cpus} -k 17 -e dmo > ${params.prefix}.mak
+    # make -f ${params.prefix}.mak
+
+    # /home/groups/ellenyeh/jdoenier/bin/smartdenovo/smartdenovo.pl -p ${params.prefix} -c 0 ${ont_reads} -t ${task.cpus} -k 17 -e dmo > ${params.prefix}.mak
+    # make -f ${params.prefix}.mak
+
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtpre -J 5000 ${ont_reads} | gzip -c -1 > sd.fa.gz
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtzmo -t ${task.cpus} -i sd.fa.gz -fo sd.dmo.ovl -k 17 -z 10 -Z 16 -U -1 -m 0.1 -A 1000
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtclp -i sd.dmo.ovl -fo sd.dmo.obt -d 3 -k 300 -m 0.1 -FT
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtlay -i sd.fa.gz -b sd.dmo.obt -j sd.dmo.ovl -fo sd.dmo.lay -w 300 -s 200 -m 0.1 -r 0.95 -c 1
+
+    """
+}
+
+
+process smartdenovo_xenic {
+
+  publishDir { params.results + pubDir + "/" + "smartdenovo_xenic" } , mode: "copy"
+  label "slurm_smartdenovo"
+  
+  input:
+    path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("assembly.fasta"), emit: asm
+    path("*")
+
+  script:
+    """
+    #/home/groups/ellenyeh/jdoenier/bin/smartdenovo/smartdenovo.pl -p ${params.prefix} -c 1 ${ont_reads} -t ${task.cpus} -k 17 -e dmo > ${params.prefix}.mak
+    #make -f ${params.prefix}.mak
+
+    #/home/groups/ellenyeh/jdoenier/bin/smartdenovo/smartdenovo.pl -p ${params.prefix} -c 0 ${ont_reads} -t ${task.cpus} -k 17 -e dmo > ${params.prefix}.mak
+    #make -f ${params.prefix}.mak
+
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtpre -J 5000 ${ont_reads} | gzip -c -1 > sd.fa.gz
+    # Changed k...
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtzmo -t ${task.cpus} -i sd.fa.gz -fo sd.dmo.ovl -k 17 -z 10 -Z 16 -U -1 -m 0.1 -A 1000
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtclp -i sd.dmo.ovl -fo sd.dmo.obt -d 3 -k 300 -m 0.1 -FT
+    /home/groups/ellenyeh/jdoenier/bin/smartdenovo/wtlay -i sd.fa.gz -b sd.dmo.obt -j sd.dmo.ovl -fo sd.dmo.lay -w 300 -s 200 -m 0.1 -r 0.95 -c 1
+    
+    mv *.utg assembly.fasta
+
+    """
+}
+
+
+process racon_nano {
+  /* 
+  A process to perform racon polishing using nanopore reads
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "racon_nano" } , mode: "copy"
+  label "slurm_racon"
+  
+  input:
+    path(assembly)
+    path(reads)
+    val(pubDir)
+
+  output:
+    path(racon_polish), emit: asm
+    path("*") 
+ 
+  script:
+    racon_polish = "${params.prefix}.racon_polish_nano_assembly.fasta"
+    iterations = 2
+    """
+    asm=$assembly
+
+    for i in {0..${iterations}};
+    do
+      minimap2 -ax map-ont \${asm} ${reads} > mapped_reads_\$i.sam -t ${task.cpus}
+      racon -t ${task.cpus} ${reads} mapped_reads_\$i.sam \$asm > racon_asm_\$i.fasta
+      asm=racon_asm_\$i.fasta
+      cat \$asm > ${racon_polish}
+    done
+    """
+}
+
+process nextPolish {
+  /* 
+  A process to perform nextPolish polishing using nanopore reads
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "nextPolish" } , mode: "copy"
+  label "slurm_nextPolish"
+  
+  input:
+    path(assembly)
+    tuple path(sr_R1), path(sr_R2)
+    path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("run_dir/*.fasta"), emit: asm
+    path("*")
+
+  script:
+    """
+
+    cat > run.cfg <<- EOM
+    [General]
+    job_type = local
+    job_prefix = nextPolish
+    task = best
+    rewrite = yes
+    rerun = 3
+    parallel_jobs = 4
+    multithread_jobs = 7
+    genome = ${assembly}.header_fixed.fasta
+    genome_size = auto
+    workdir = ./run_dir
+    polish_options = -p 7
+
+    [sgs_option]
+    sgs_fofn = ./sgs.fofn
+    sgs_options = -max_depth 100 -bwa
+
+    [lgs_option]
+    lgs_fofn = ./lgs.fofn
+    lgs_options = -min_read_len 1k -max_depth 100
+    lgs_minimap2_options = -x map-ont
+
+    EOM
+    
+    ls ${sr_R1} ${sr_R2} > sgs.fofn
+    ls ${ont_reads} > lgs.fofn
+
+    # fix bad heads...
+    sed '/^>/ s/:.*//' ${assembly} > ${assembly}.header_fixed.fasta
+
+    # set +e # don't quit on error...
+    /home/groups/ellenyeh/jdoenier/bin/NextPolish/nextPolish run.cfg
+
+    """
+}
+
+
+process nextPolish_extra {
+  /* 
+  A process to perform nextPolish polishing using nanopore reads
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "nextPolish" } , mode: "copy"
+  label "slurm_nextPolish_extra"
+  
+  input:
+    path(assembly)
+    tuple path(sr_R1), path(sr_R2)
+    path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("run_dir/*.fasta"), emit: asm
+    path("*")
+
+  script:
+    """
+
+    cat > run.cfg <<- EOM
+    [General]
+    job_type = slurm
+    job_prefix = nextPolish
+    task = 555121212
+    rewrite = yes
+    rerun = 3
+    parallel_jobs = 50
+    multithread_jobs = 8
+    genome = ${assembly}.header_fixed.fasta
+    genome_size = auto
+    workdir = ./run_dir
+    polish_options = -p 8
+
+    [sgs_option]
+    sgs_fofn = ./sgs.fofn
+    sgs_options = -max_depth 100 -bwa
+
+    [lgs_option]
+    lgs_fofn = ./lgs.fofn
+    lgs_options = -min_read_len 1k -max_depth 100
+    lgs_minimap2_options = -x map-ont
+    
+    submit = sbatch --cpus-per-task={cpu} --mem-per-cpu=6G -t 120 -p normal,owners,ellenyeh -o {out} -e {err} {script}
+
+    EOM
+    
+    ls ${sr_R1} ${sr_R2} > sgs.fofn
+    ls ${ont_reads} > lgs.fofn
+
+
+
+    # fix bad heads...
+    sed '/^>/ s/:.*//' ${assembly} > ${assembly}.header_fixed.fasta
+
+    # set +e # don't quit on error...
+    /home/groups/ellenyeh/jdoenier/bin/NextPolish/nextPolish run.cfg
+    
+    """
+}
+
+process polca {
+  /* 
+  A process to perform nextPolish polishing using nanopore reads
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "polca" } , mode: "copy"
+  label "slurm_polca"
+  conda '/home/groups/ellenyeh/git_test/assembly_nanopore/masurca/'
+  
+  input:
+    path(assembly)
+    tuple path(sr_R1), path(sr_R2)
+    val(pubDir)
+
+  output:
+    path("*PolcaCorrected.fa"), emit: asm
+    path("*")
+
+  script:
+    """
+    polca.sh -a ${assembly} -r '${sr_R1} ${sr_R2}' -t ${task.cpus} -m 1G
+    """
+}
+
+
+process decontaminate {
+   /* 
+  Identify potential contamination in the assembly
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "decontaminate" } , mode: "copy"
+  label "slurm_mapping"
+
+  input:
+    path(assembly)
+    tuple path(sr_R1), path(sr_R2)
+    // path(ont_reads)
+    val(pubDir)
+
+  output:
+    path("filtered_${assembly}"), emit: asm
+    path("*")
+
+  script:
+    coverage=70 //  % of contig that has reads mapped to it
+    scale_factor=25 // 1/scale_factor read depth required to keep contig
+    """
+    bwa index ${assembly} 
+    bwa mem -t ${task.cpus} ${assembly} ${sr_R1} ${sr_R2} | samtools view -b | samtools sort -m 8G -@ 8 -o aln.bam
+    samtools coverage aln.bam > coverage.txt
+    declare \$(awk '{ sum += \$7 } END { if (NR > 0) print "min_depth="sum/NR/${scale_factor} }' coverage.txt) 
+    awk -v min_depth="\$min_depth" '\$6>${coverage} && \$7>min_depth' coverage.txt | awk '{if (NR!=1) {print \$1}}' > keep_contigs.txt
+    seqtk subseq ${assembly} keep_contigs.txt > filtered_${assembly}
+    """
+}
+
+process fix_organelles {
+  /* 
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "fix_organelles" } , mode: "copy"
+  label "slurm_trivial"
+
+  input:
+    path(assembly)
+    path(spheroid_body)
+    path(chloroplast)
+    path(mitochondria)
+    val(pubDir)
+
+  output:
+    path("organelle_fixed_${assembly}"), emit: asm
+    path("*")
+
+  script:    
+    coverage=50 //  % of contig that has reads mapped to it
+    """
+    cat ${spheroid_body} ${chloroplast} ${mitochondria} > comb.fasta
+    minimap2 -ax asm5 ${assembly} comb.fasta | samtools view -b | samtools sort -m 4G -@ ${task.cpus} -o comb.bam
+    samtools coverage comb.bam > coverage.txt
+
+    # keep contigs that don't match well to the input contigs
+    awk '\$6<${coverage}' coverage.txt > keep_contigs.txt
+    seqtk subseq ${assembly} keep_contigs.txt > organelle_removed_${assembly}
+
+    cat organelle_removed_${assembly} > organelle_fixed_${assembly}
+    cat ${spheroid_body} ${chloroplast} ${mitochondria} >> organelle_fixed_${assembly}
+    """
+}
+
+process purge_haplotigs {
+  /* 
+  */ 
+
+  publishDir { params.results + pubDir + "/" + "purge_haplotigs" } , mode: "copy"
+  label "slurm_purgedups"
+
+  input:
+    path(assembly)
+    path(ont_reads)
+    val(s)
+    val(a)
+    val(pubDir)
+
+  output:
+    path("${assembly}.curated.fasta"), emit: asm
+    path("*")
+
+  script:
+    """
+    minimap2 -t ${task.cpus} -ax map-ont ${assembly} ${ont_reads} | samtools view -b | samtools sort -m 4G -@ ${task.cpus} -o mapped_reads.sorted.bam
+
+    purge_haplotigs hist -b mapped_reads.sorted.bam -g ${assembly}
+
+    purge_haplotigs cov -i mapped_reads.sorted.bam.gencov -l 5 -m 50 -h 90 -o coverage_stats.csv -j 101 -s ${s} 
+
+    purge_haplotigs purge -g ${assembly} -c coverage_stats.csv -o ${assembly}.curated -a ${a}
+
+    """
+}

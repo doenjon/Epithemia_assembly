@@ -1,0 +1,80 @@
+import java.time.LocalDateTime
+nextflow.enable.dsl=2
+
+print_params() // Print params for transparency 
+
+include { preprocess_nanopore; preprocess_nanopore as preprocess_nanopore2; preprocess_illumina; remove_organelle_reads} from "./src/read_processing.nx"
+include { shasta_assembly; flye_assembly; nextdenovo_assembly; smartdenovo_assembly} from "./src/genome_assembly.nx"
+include { annotate_genome } from "./src/annotate_genome.nx"
+
+////////////////////////////////////////////////////////////////////////
+/////////////////////////// Work flows /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+// MAIN workflow
+workflow {
+
+  // Clean illumina reads
+  illumina_reads = preprocess_illumina().illumina_reads
+
+  // Clean axenic nanopore reads
+  ont_reads_axenic = preprocess_nanopore(params.fast5_dir, params.ont_reads_axenic, 14, "axenic").ont_reads  
+
+  // Clean xenic nanopore reads
+  ont_reads_xenic = preprocess_nanopore2(params.fast5_dir_xenic, params.ont_reads_xenic, 14, "xenic").ont_reads
+
+  // Perform Assembly and Analysis
+  shasta_assembly(ont_reads_axenic, ont_reads_xenic, illumina_reads)
+  nextdenovo_assembly(ont_reads_axenic, ont_reads_xenic, illumina_reads)
+  smartdenovo_assembly(ont_reads_axenic, ont_reads_xenic, illumina_reads)
+
+  // Save copy of scripts for documentation
+  document()
+
+}
+
+////////////////////////////////////////////////////////////////////////
+//////////////////////////// Processes /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+process document {
+  /* 
+  A process to save a copy of the scripts used to perform the run
+  */
+  
+  publishDir { params.results + "/" + "documentation" } , mode: "copy"
+  label "slurm_trivial"
+
+  output:
+    path("*")
+
+  script:
+    """
+    cp ${projectDir}/*.nx ./
+    cp -r ${projectDir}/src ./
+    """
+}
+
+////////////////////////////////////////////////////////////////////////
+//////////////////////////// Functions /////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+def print_params() {
+  def param_log = """Parameters:
+  \tresults:        $params.results
+  \tscripts:        $params.scripts
+  \tresources:      $params.resources
+  \tdiamond_db:     $params.diamond_db
+  \tnr_nodes_db:    $params.nr_nodes_db
+  \tnr_names_db:    $params.nr_names_db
+
+  \tprefix:         $params.prefix
+  \tont_reads_axen: $params.ont_reads_axenic   <- will be ignored if fast5_dir is set
+  \tont_reads_xen:  $params.ont_reads_xenic   <- will be ignored if fast5_dir is set
+  \tillumina:       $params.illumina  
+  \tfast5_dir:      $params.fast5_dir
+  \tguppy_config:   $params.guppy_config
+  \tguppy_model:    $params.guppy_model
+  """
+  println(param_log)
+}
